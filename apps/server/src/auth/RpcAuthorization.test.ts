@@ -5,6 +5,7 @@ import {
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   AuthOrchestrationOperateScope,
@@ -291,10 +292,17 @@ describe("settings mutation authorization", () => {
         tag !== WS_METHODS.serverUpdateSettings,
     ),
   );
-  const providerInstanceMutation = {
-    operation: "remove" as const,
-    instanceId: ProviderInstanceId.make("codex_work"),
-  };
+  const providerMutations = [
+    { operation: "remove", instanceId: ProviderInstanceId.make("codex_work") },
+    {
+      operation: "set-inventory-item",
+      instanceId: ProviderInstanceId.make("codex_work"),
+      driver: ProviderDriverKind.make("codex"),
+      kind: "skills",
+      itemId: "/skills/pdf/SKILL.md",
+      enabledInT3: false,
+    },
+  ] as const;
 
   it.effect("allows provider-only mutations while denying mixed settings without their grant", () =>
     Effect.gen(function* () {
@@ -312,19 +320,20 @@ describe("settings mutation authorization", () => {
           ),
         ),
       );
-      yield* client[WS_METHODS.serverUpdateSettings]({ patch: {}, providerInstanceMutation });
-      expect(handled).toBe(1);
-      expect(
-        yield* client[WS_METHODS.serverUpdateSettings]({
-          patch: { defaultRuntimeMode: "full-access" },
-          providerInstanceMutation,
-        }).pipe(Effect.flip),
-      ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
-      expect(handled).toBe(1);
+      for (const providerInstanceMutation of providerMutations) {
+        yield* client[WS_METHODS.serverUpdateSettings]({ patch: {}, providerInstanceMutation });
+        expect(
+          yield* client[WS_METHODS.serverUpdateSettings]({
+            patch: { defaultRuntimeMode: "full-access" },
+            providerInstanceMutation,
+          }).pipe(Effect.flip),
+        ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+      }
+      expect(handled).toBe(providerMutations.length);
     }).pipe(Effect.scoped),
   );
 
-  it.effect("does not let a settings grant create or remove providers", () =>
+  it.effect("requires provider permission for provider mutations", () =>
     Effect.gen(function* () {
       let handled = false;
       const client = yield* RpcTest.makeClient(group).pipe(
@@ -340,12 +349,14 @@ describe("settings mutation authorization", () => {
           ),
         ),
       );
-      expect(
-        yield* client[WS_METHODS.serverUpdateSettings]({
-          patch: {},
-          providerInstanceMutation,
-        }).pipe(Effect.flip),
-      ).toMatchObject({ requiredPermission: AuthProvidersManageScope });
+      for (const providerInstanceMutation of providerMutations) {
+        expect(
+          yield* client[WS_METHODS.serverUpdateSettings]({
+            patch: {},
+            providerInstanceMutation,
+          }).pipe(Effect.flip),
+        ).toMatchObject({ requiredPermission: AuthProvidersManageScope });
+      }
       expect(handled).toBe(false);
     }).pipe(Effect.scoped),
   );

@@ -143,6 +143,22 @@ export function applyProviderInstanceMutation(
   const providerInstances = { ...settings.providerInstances };
   if (mutation.operation === "upsert" || mutation.operation === "create") {
     providerInstances[mutation.instanceId] = mutation.instance;
+  } else if (mutation.operation === "set-inventory-item") {
+    // Resolve the item against the settings protected by the write semaphore,
+    // so clients can toggle different items without overwriting each other.
+    const instance = providerInstances[mutation.instanceId] ?? { driver: mutation.driver };
+    const disabledInventory = { ...instance.disabledInventory };
+    const ids = new Set(disabledInventory[mutation.kind]);
+    if (mutation.enabledInT3) ids.delete(mutation.itemId);
+    else ids.add(mutation.itemId);
+    if (ids.size > 0) disabledInventory[mutation.kind] = [...ids];
+    else delete disabledInventory[mutation.kind];
+    const { disabledInventory: _omit, ...rest } = instance;
+    providerInstances[mutation.instanceId] = Object.values(disabledInventory).some(
+      (values) => values.length > 0,
+    )
+      ? { ...rest, disabledInventory }
+      : rest;
   } else {
     delete providerInstances[mutation.instanceId];
   }
@@ -165,6 +181,22 @@ function ensureProviderInstanceMutationAllowed(
         providerInstanceId: mutation.instanceId,
       }),
     );
+  }
+  if (mutation.operation === "set-inventory-item") {
+    const instance = settings.providerInstances[mutation.instanceId];
+    if (
+      instance
+        ? instance.driver !== mutation.driver
+        : mutation.instanceId !== defaultInstanceIdForDriver(mutation.driver)
+    ) {
+      return Effect.fail(
+        new ServerSettingsError({
+          settingsPath,
+          operation: "update-provider-inventory",
+          providerInstanceId: mutation.instanceId,
+        }),
+      );
+    }
   }
   return Effect.void;
 }

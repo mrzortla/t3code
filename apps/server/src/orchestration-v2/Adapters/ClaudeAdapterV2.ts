@@ -88,6 +88,7 @@ import {
   type OrchestrationV2WebSearchResult,
   type ProviderApprovalDecision,
   ProviderDriverKind,
+  type ProviderDisabledInventory,
   type ProviderInstanceId,
   type ProviderRequestKind,
   type ProviderUserInputAnswers,
@@ -123,6 +124,10 @@ import {
   planClaudeSkillDispatch,
   type ClaudeSkillTarget,
 } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
+import {
+  claudeDisabledInventorySettings,
+  withClaudeDisabledInventory,
+} from "../../provider/Drivers/ClaudeInventory.ts";
 import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import {
   compileClaudeModelSelection,
@@ -3792,6 +3797,7 @@ export interface ClaudeAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
   readonly settings: ClaudeSettings;
   readonly environment: NodeJS.ProcessEnv;
+  readonly disabledInventory?: ProviderDisabledInventory;
   readonly attachmentsDir: string;
   readonly fileSystem: FileSystem.FileSystem;
   readonly path: Path.Path;
@@ -3858,6 +3864,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     },
   );
 
+  const disabledInventory = adapterOptions.disabledInventory ?? {};
+  const disabledInventorySettings = claudeDisabledInventorySettings(disabledInventory);
   const userInvocableSkills = (cwd: string | null) =>
     discoverClaudeSkills(
       adapterOptions.settings,
@@ -3867,7 +3875,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
       Effect.map(
         (skills) =>
           new Map(
-            skills
+            withClaudeDisabledInventory(skills, disabledInventory)
               .filter((skill) => skill.enabled && skill.userInvocable !== false)
               .map((skill) => [skill.name, skill]),
           ),
@@ -9150,6 +9158,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             cwd: turnInput.runtimePolicy.cwd,
             attachmentsDir,
             settings: adapterOptions.settings,
+            ...(disabledInventorySettings === undefined
+              ? {}
+              : { sdkSettings: disabledInventorySettings }),
             environment: adapterOptions.environment,
             tools: queryPolicy.tools ?? CLAUDE_CODE_PRESET_TOOLS,
             ...(mcpOverrides.allowedTools === undefined
@@ -10346,6 +10357,9 @@ export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
       instanceId,
       settings: { ...config, enabled, binaryPath },
       environment: claudeEnvironment,
+      ...(input.disabledInventory === undefined
+        ? {}
+        : { disabledInventory: input.disabledInventory }),
       attachmentsDir: serverConfig.attachmentsDir,
       fileSystem,
       path,

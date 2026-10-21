@@ -457,6 +457,20 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
   });
 });
 
+function layerRebuildingRegistry(
+  adapter: ProviderAdapter.ProviderAdapterV2["Service"],
+  instanceBuild: Ref.Ref<number>,
+) {
+  return Layer.succeed(
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+      get: () => Effect.succeed(adapter),
+      list: () => Effect.succeed([adapter.instanceId]),
+      instanceBuild: () => Ref.get(instanceBuild),
+    }),
+  );
+}
+
 function layerTest(input: {
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs: number;
@@ -488,6 +502,8 @@ function layerTest(input: {
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
+  /** Bumping it is a settings change rebuilding the instance. */
+  readonly instanceBuild?: Ref.Ref<number>;
 }) {
   const layerConfiguredEventSink =
     input.flakyReleaseWrites !== undefined
@@ -523,7 +539,13 @@ function layerTest(input: {
       ...(input.scopeCloseReached === undefined
         ? {}
         : { scopeCloseReached: input.scopeCloseReached }),
-    }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
+    }).pipe(
+      Effect.map((adapter) =>
+        input.instanceBuild === undefined
+          ? ProviderAdapterRegistry.layerSingle(adapter)
+          : layerRebuildingRegistry(adapter, input.instanceBuild),
+      ),
+    ),
   );
   const layerConfiguredMcpRegistry =
     input.pauseResolve === undefined
@@ -1116,6 +1138,138 @@ it.effect("ProviderSessionManagerV2 opens a duplicate session only once", () =>
         }),
       ),
     );
+  }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 reopens an idle shared session after its provider is rebuilt",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const instanceBuild = yield* Ref.make(0);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const firstThreadId = ThreadId.make("thread-provider-session-manager-rebuild-first");
+        const secondThreadId = ThreadId.make("thread-provider-session-manager-rebuild-second");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: firstThreadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: secondThreadId, now }),
+          ],
+        });
+
+        const before = yield* manager.open({
+          threadId: firstThreadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* Ref.set(instanceBuild, 1);
+        const after = yield* manager.open({
+          threadId: secondThreadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+
+        assert.notStrictEqual(after, before);
+        const counts = yield* Ref.get(state);
+        assert.equal(counts.openCount, 2);
+        assert.equal(counts.closeCount, 1);
+        // The rebuilt adapter's session is reused as long as nothing changes again.
+        assert.strictEqual(
+          yield* manager.open({
+            threadId: firstThreadId,
+            providerSessionId,
+            modelSelection,
+            runtimePolicy,
+          }),
+          after,
+        );
+      });
+
+      yield* effect.pipe(
+        Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, instanceBuild })),
+      );
+    }),
+);
+
+it.effect("ProviderSessionManagerV2 keeps a busy session after its provider is rebuilt", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const instanceBuild = yield* Ref.make(0);
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const busyThreadId = ThreadId.make("thread-provider-session-manager-rebuild-busy");
+      const nextThreadId = ThreadId.make("thread-provider-session-manager-rebuild-next");
+      const providerSessionId = idAllocator.derive.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+      });
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId: busyThreadId, now }),
+          yield* makeThreadCreatedEvent({ idAllocator, threadId: nextThreadId, now }),
+        ],
+      });
+
+      const runtime = yield* manager.open({
+        threadId: busyThreadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const runId = idAllocator.derive.run({ threadId: busyThreadId, ordinal: 1 });
+      yield* runtime.startTurn({
+        appThread: (yield* projectionStore.getThreadProjection(busyThreadId)).thread,
+        threadId: busyThreadId,
+        runId,
+        runOrdinal: 1,
+        providerTurnOrdinal: 1,
+        attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+        rootNodeId: idAllocator.derive.rootNode({ runId }),
+        providerThread: makeProviderThread({
+          idAllocator,
+          threadId: busyThreadId,
+          providerSessionId,
+          now,
+        }),
+        message: {
+          createdBy: "user",
+          creationSource: "web",
+          messageId: yield* idAllocator.allocate.message({ threadId: busyThreadId, ordinal: 1 }),
+          text: "hello",
+          attachments: [],
+        },
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* Ref.set(instanceBuild, 1);
+
+      assert.strictEqual(
+        yield* manager.open({
+          threadId: nextThreadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        }),
+        runtime,
+      );
+      const counts = yield* Ref.get(state);
+      assert.equal(counts.openCount, 1);
+      assert.equal(counts.closeCount, 0);
+    });
+
+    yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, instanceBuild })));
   }),
 );
 
